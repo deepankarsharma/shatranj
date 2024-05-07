@@ -1,3 +1,5 @@
+
+
 use std::io;
 use pgn_reader::{Visitor, Skip, BufferedReader, SanPlus};
 
@@ -30,6 +32,8 @@ impl Visitor for MoveCounter {
         self.moves
     }
 }
+
+
 
 fn main() -> io::Result<()> {
     let pgn = b"1. e4 e5 2. Nf3 (2. f4)
