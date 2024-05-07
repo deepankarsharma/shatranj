@@ -1,0 +1,9 @@
+[package]
+name = "shatranj"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pgn-reader = "0.26.0"
+datafusion = "37.1.0"
+config = "0.14.0"
