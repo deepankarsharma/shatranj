@@ -1,6 +1,8 @@
+#![feature(stdarch_x86_avx512)]
+
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::fs::File;
-use std::io::{Error, Read, self, IoSliceMut, BufRead, BufReader};
+use std::io::{Error, Read, self, BufRead, BufReader};
 use std::os::unix::fs::OpenOptionsExt;
 use memmap2::Mmap;
 use std::process::Command;
@@ -8,8 +10,9 @@ use std::os::unix::io::AsRawFd;
 use io_uring::{opcode, types, IoUring};
 use libc::iovec;
 
-const BUFFER_SIZE: usize = 8192;
-const NUM_BUFFERS: usize = 32;
+
+const BUFFER_SIZE: usize = 65536;
+const NUM_BUFFERS: usize = 64;
 fn get_filename() -> String {
     std::env::var("IO_BENCH_DATA_FILE").unwrap()
 }
@@ -31,7 +34,7 @@ fn reset_file_caches() {
 
 fn count_newlines_standard(filename: &str) -> Result<usize, std::io::Error> {
     let file = File::open(filename)?;
-    let reader = BufReader::new(file);
+    let reader = BufReader::with_capacity(16 * 1024, file);
 
     let newline_count = reader.lines().count();
 
@@ -70,6 +73,60 @@ fn count_newlines_memmap(filename: &str) -> Result<usize, Error> {
     Ok(newline_count)
 }
 
+unsafe fn count_newlines_memmap_avx2(filename: &str) -> Result<usize, Error> {
+    let file = File::open(filename)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+
+    let newline_byte = b'\n';
+    let newline_vector = _mm256_set1_epi8(newline_byte as i8);
+    let mut newline_count = 0;
+
+    let mut ptr = mmap.as_ptr();
+    let end_ptr = unsafe { ptr.add(mmap.len()) };
+
+    while ptr <= end_ptr.sub(32) {
+        let data = unsafe { _mm256_loadu_si256(ptr as *const __m256i) };
+        let cmp_result = _mm256_cmpeq_epi8(data, newline_vector);
+        let mask = _mm256_movemask_epi8(cmp_result);
+        newline_count += mask.count_ones() as usize;
+        ptr = unsafe { ptr.add(32) };
+    }
+
+    // Count remaining bytes
+    let remaining_bytes = end_ptr as usize - ptr as usize;
+    newline_count += mmap[mmap.len() - remaining_bytes..].iter().filter(|&&b| b == newline_byte).count();
+
+    reset_file_caches();
+    Ok(newline_count)
+}
+
+use std::arch::x86_64::*;
+
+unsafe fn count_newlines_memmap_avx512(filename: &str) -> Result<usize, Error> {
+    let file = File::open(filename)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+
+    let newline_byte = b'\n';
+    let newline_vector = _mm512_set1_epi8(newline_byte as i8);
+    let mut newline_count = 0;
+
+    let mut ptr = mmap.as_ptr();
+    let end_ptr = unsafe { ptr.add(mmap.len()) };
+
+    while ptr <= end_ptr.sub(64) {
+        let data = unsafe { _mm512_loadu_si512(ptr as *const i32) };
+        let cmp_result = _mm512_cmpeq_epi8_mask(data, newline_vector);
+        newline_count += cmp_result.count_ones() as usize;
+        ptr = unsafe { ptr.add(64) };
+    }
+
+    // Count remaining bytes
+    let remaining_bytes = end_ptr as usize - ptr as usize;
+    newline_count += mmap[mmap.len() - remaining_bytes..].iter().filter(|&&b| b == newline_byte).count();
+
+    reset_file_caches();
+    Ok(newline_count)
+}
 
 
 fn count_newlines_vectored_io(path: &str) -> Result<usize, Error>  {
@@ -201,7 +258,6 @@ fn count_lines_io_uring_vectored(path: &str) -> io::Result<usize> {
 
         offset += bytes_read as u64;
     }
-
     Ok(line_count)
 }
 
@@ -210,6 +266,11 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("count_newlines_direct_io", |b| b.iter(|| count_newlines_direct_io(path.as_str())));
     c.bench_function("count_newlines_standard", |b| b.iter(|| count_newlines_standard(path.as_str())));
     c.bench_function("count_newlines_memmap", |b| b.iter(|| count_newlines_memmap(path.as_str())));
+    unsafe {
+        c.bench_function("count_newlines_memmap_avx2", |b| b.iter(|| count_newlines_memmap_avx2(path.as_str())));
+        c.bench_function("count_newlines_memmap_avx512", |b| b.iter(|| count_newlines_memmap_avx512(path.as_str())));
+    }
+
     c.bench_function("count_newlines_vectored_io", |b| b.iter(|| count_newlines_vectored_io(path.as_str())));
     c.bench_function("count_lines_io_uring", |b| b.iter(|| count_lines_io_uring(path.as_str())));
     c.bench_function("count_lines_io_uring_vectored", |b| b.iter(|| count_lines_io_uring_vectored(path.as_str())));
