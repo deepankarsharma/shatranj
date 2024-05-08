@@ -41,7 +41,7 @@ pub fn count_newlines_standard(filename: &str) -> Result<usize, std::io::Error> 
     Ok(newline_count)
 }
 
-#[cfg(feature = "profiled")]
+
 pub fn count_newlines_standard_non_appending(filename: &str) -> Result<usize, std::io::Error> {
     let file = File::open(filename)?;
     let mut reader = BufReader::with_capacity(64 * 1024, file);
