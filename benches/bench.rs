@@ -11,6 +11,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("count_newlines_memmap", |b| b.iter(|| count_newlines_memmap(path.as_str())));
     unsafe {
         c.bench_function("count_newlines_memmap_avx2", |b| b.iter(|| count_newlines_memmap_avx2(path.as_str())));
+        c.bench_function("count_newlines_memmap_avx2_running_sum", |b| b.iter(|| count_newlines_memmap_avx2_running_sum(path.as_str())));
         c.bench_function("count_newlines_memmap_avx512", |b| b.iter(|| count_newlines_memmap_avx512(path.as_str())));
     }
 

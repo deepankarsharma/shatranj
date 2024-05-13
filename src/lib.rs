@@ -3,17 +3,34 @@
 use std::fs::File;
 use std::io::{Error, Read, self, BufRead, BufReader};
 use std::os::unix::fs::OpenOptionsExt;
-use memmap2::Mmap;
+use memmap2::{Advice, Mmap};
 use std::process::Command;
 use std::os::unix::io::AsRawFd;
 use io_uring::{opcode, types, IoUring};
 use libc::iovec;
 use std::arch::x86_64::*;
+use std::fmt;
 
 const BUFFER_SIZE: usize = 65536;
 const NUM_BUFFERS: usize = 64;
 pub fn get_filename() -> String {
     std::env::var("IO_BENCH_DATA_FILE").unwrap()
+}
+
+fn print_m256i(value: __m256i) {
+    let mut bytes = [0u8; 32];
+    unsafe {
+        std::arch::x86_64::_mm256_storeu_si256(bytes.as_mut_ptr() as *mut _, value);
+    }
+
+    print!("[");
+    for i in 0..32 {
+        print!("{:#04x}", bytes[i]);
+        if i < 31 {
+            print!(", ");
+        }
+    }
+    println!("]");
 }
 
 fn reset_file_caches() {
@@ -89,6 +106,7 @@ pub fn count_newlines_direct_io(filename: &str) -> Result<usize, Error> {
 pub fn count_newlines_memmap(filename: &str) -> Result<usize, Error> {
     let file = File::open(filename)?;
     let mmap = unsafe { Mmap::map(&file)? };
+    mmap.advise(Advice::Sequential)?;
 
     let newline_count = mmap.iter().filter(|&&b| b == b'\n').count();
     reset_file_caches();
@@ -98,6 +116,7 @@ pub fn count_newlines_memmap(filename: &str) -> Result<usize, Error> {
 pub unsafe fn count_newlines_memmap_avx2(filename: &str) -> Result<usize, Error> {
     let file = File::open(filename)?;
     let mmap = unsafe { Mmap::map(&file)? };
+    mmap.advise(Advice::Sequential)?;
 
     let newline_byte = b'\n';
     let newline_vector = _mm256_set1_epi8(newline_byte as i8);
@@ -122,11 +141,73 @@ pub unsafe fn count_newlines_memmap_avx2(filename: &str) -> Result<usize, Error>
     Ok(newline_count)
 }
 
+pub unsafe fn avx_hsum(a: __m256i) -> i32 {
+    let zero = _mm256_setzero_si256();
+    let unpacked_lo = _mm256_unpacklo_epi8(a, zero);
+    let unpacked_hi = _mm256_unpackhi_epi8(a, zero);
+
+    let sum16_lo = _mm256_hadd_epi16(unpacked_lo, unpacked_hi);
+    let sum16_lo1 = _mm256_hadd_epi16(sum16_lo, zero);
+    let sum16_lo2 = _mm256_hadd_epi16(sum16_lo1, zero);
+    let sum16_lo3 = _mm256_hadd_epi16(sum16_lo2, zero);
+
+    let result = _mm256_extract_epi16::<0>(sum16_lo3) + _mm256_extract_epi16::<8>(sum16_lo3);
+    result as i32
+}
+
+pub unsafe fn count_newlines_memmap_avx2_running_sum(filename: &str) -> Result<usize, Error> {
+    let file = File::open(filename)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    mmap.advise(Advice::Sequential)?;
+
+    let newline_byte = b'\n';
+    let newline_vector = _mm256_set1_epi8(newline_byte as i8);
+
+    let mut newline_count = 0;
+    let mut running_sum = _mm256_setzero_si256();
+
+    let mut ptr = mmap.as_ptr();
+    let end_ptr = unsafe { ptr.add(mmap.len()) };
+
+    let mut iteration_count = 0;
+    let ones_mask = _mm256_set1_epi8(1);
+
+    while ptr <= end_ptr.sub(32) {
+
+        let data = unsafe { _mm256_loadu_si256(ptr as *const __m256i) };
+        let cmp_result = _mm256_cmpeq_epi8(data, newline_vector);
+        let masked_ones = _mm256_and_si256(cmp_result, ones_mask);
+
+        running_sum = _mm256_add_epi8(running_sum, masked_ones);
+
+        ptr = unsafe { ptr.add(32) };
+        iteration_count += 1;
+
+        if iteration_count % 128 == 0 {
+            newline_count += avx_hsum(running_sum) as usize;
+            running_sum = _mm256_setzero_si256();
+        }
+    }
+
+    // Process remaining iterations
+    if iteration_count % 128 != 0 {
+        newline_count += avx_hsum(running_sum) as usize;
+    }
+
+    // Count remaining bytes
+    let remaining_bytes = end_ptr as usize - ptr as usize;
+    newline_count += mmap[mmap.len() - remaining_bytes..].iter().filter(|&&b| b == newline_byte).count();
+
+    reset_file_caches();
+
+    Ok(newline_count)
+}
 
 
 pub unsafe fn count_newlines_memmap_avx512(filename: &str) -> Result<usize, Error> {
     let file = File::open(filename)?;
     let mmap = unsafe { Mmap::map(&file)? };
+    mmap.advise(Advice::Sequential)?;
 
     let newline_byte = b'\n';
     let newline_vector = _mm512_set1_epi8(newline_byte as i8);
@@ -283,3 +364,43 @@ pub fn count_lines_io_uring_vectored(path: &str) -> io::Result<usize> {
     Ok(line_count)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    #[test]
+    fn test_avx_hsum_all_ones() {
+        unsafe {
+            let a = _mm256_set1_epi8(1);
+            let expected_sum = 32;
+            let result = avx_hsum(a);
+            assert_eq!(result, expected_sum);
+        }
+    }
+
+    #[test]
+    fn test_avx_hsum_all_zeros() {
+        unsafe {
+            let a = _mm256_setzero_si256();
+            let expected_sum = 0;
+            let result = avx_hsum(a);
+            assert_eq!(result, expected_sum);
+        }
+
+    }
+
+    #[test]
+    fn test_avx_hsum_alternating_values() {
+        unsafe {
+            let a = _mm256_set_epi8(
+                1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2,
+                1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2,
+            );
+            let expected_sum = 48;
+            let result = avx_hsum(a);
+            assert_eq!(result, expected_sum);
+        }
+    }
+
+}
